@@ -53,6 +53,12 @@ main{padding:12px 16px}
 .task.done .title{text-decoration:line-through}
 .task.done .chk i{background:var(--done);border-color:var(--done);color:#fff}
 .task.done .shift{display:none}
+.title.ph{color:var(--sub);font-weight:400}
+.gear{margin-left:auto;font-size:12px;padding:6px 10px;border-radius:999px;background:var(--card);color:var(--sub);border:1px solid var(--line);display:flex;align-items:center;gap:5px}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--sub);display:inline-block}
+.dot.ok{background:var(--done)}.dot.ng{background:var(--warn)}
+.cfgbtn{display:block;width:100%;margin-top:10px;padding:13px;border-radius:12px;font-weight:600;font-size:15px}
+#cfgStatus{font-size:13px;line-height:1.7;margin-top:12px;white-space:pre-wrap}
 .nowtag{font-size:10px;color:var(--accent);font-weight:700;letter-spacing:.05em}
 .empty{text-align:center;color:var(--sub);padding:40px 10px;line-height:1.8}
 .empty button{margin-top:12px;padding:10px 16px;border-radius:12px;background:var(--accent2);color:#fff;font-weight:600}
@@ -102,6 +108,7 @@ main{padding:12px 16px}
   <div class="opts">
     <button class="chip on" id="cascade">後ろのタスクも一緒にずらす</button>
     <button class="chip" id="hide">済を隠す</button>
+    <button class="gear" id="gear"><span class="dot" id="syncDot"></span>設定</button>
   </div>
 </header>
 <main id="list"></main>
@@ -120,7 +127,7 @@ main{padding:12px 16px}
     <button class="primary" id="save">保存</button>
   </div>
   <div class="hint" id="sMsg" style="color:var(--warn);font-size:13px;min-height:0"></div>
-  <label>タスク</label>
+  <label>タスク(空欄でもOK・空欄は通知しません)</label>
   <input type="text" id="fTitle" placeholder="例:朝ごはん" enterkeyhint="done">
   <label>時間(数字をタップして選択)</label>
   <div class="tblock">
@@ -145,6 +152,22 @@ main{padding:12px 16px}
   <div class="hint" id="delHint" style="display:none">もう一度押すと削除します</div>
 </div>
 
+<div class="sheet" id="cfg">
+  <div class="shead">
+    <button class="ghost" id="cfgClose">閉じる</button>
+    <h3>同期と通知</h3>
+    <span style="min-width:80px"></span>
+  </div>
+  <label>サーバーURL</label>
+  <input type="text" id="cfgUrl" placeholder="https://〜.workers.dev" autocapitalize="off" autocorrect="off" spellcheck="false">
+  <label>合言葉</label>
+  <input type="text" id="cfgToken" autocapitalize="off" autocorrect="off" spellcheck="false">
+  <button class="cfgbtn primary" id="cfgSave">保存して接続</button>
+  <button class="cfgbtn ghost" id="cfgPush">通知をオンにする</button>
+  <button class="cfgbtn ghost" id="cfgTest">テスト通知を送る</button>
+  <div id="cfgStatus"></div>
+</div>
+
 <script>
 (function(){
 const $=id=>document.getElementById(id);
@@ -159,6 +182,8 @@ let cur=new Date();cur.setHours(0,0,0,0);
 let days={};          // key -> tasks[]
 let template=null;    // tasks[]
 let cascade=true,hideDone=false;
+let dayTs={},tplTs=0;          // 同期用:最後に変更した時刻
+let cfg={url:'',token:''};
 
 /* ---------- storage: local first, cloud when available ---------- */
 function lsGet(k){try{return JSON.parse(localStorage.getItem(k))}catch(e){return null}}
@@ -167,6 +192,8 @@ function lsSet(k,v){try{localStorage.setItem(k,JSON.stringify(v))}catch(e){}}
   const d=lsGet('dt_days');if(d)days=d;
   template=lsGet('dt_tpl');
   const o=lsGet('dt_opts');if(o){cascade=o.cascade!==false;hideDone=!!o.hideDone}
+  dayTs=lsGet('dt_dayTs')||{};tplTs=lsGet('dt_tplTs')||0;
+  const c=lsGet('dt_cfg');if(c)cfg=c;
 })();
 function seedIfFirst(){
   if(Object.keys(days).length===0&&!template){
@@ -183,12 +210,75 @@ function seedIfFirst(){
 }
 seedIfFirst();
 
-function persistDay(k){
-  lsSet('dt_days',days);
+// 数字だけの仮タスク名は空欄として扱う(初回のみ移行)
+function isPlaceholder(t){return /^\s*[0-9０-９]+\s*$/.test(t||'')}
+function migrate(arr){let ch=false;(arr||[]).forEach(x=>{if(x&&isPlaceholder(x.t)){x.t='';ch=true}});return ch}
+(function(){
+  if(lsGet('dt_mig1'))return;
+  Object.keys(days).forEach(k=>{if(days[k]&&migrate(days[k]))dayTs[k]=Date.now()});
+  if(template&&migrate(template))tplTs=Date.now();
+  lsSet('dt_days',days);lsSet('dt_tpl',template);lsSet('dt_dayTs',dayTs);lsSet('dt_tplTs',tplTs);lsSet('dt_mig1',1);
+})();
+
+function persistDay(k,auto){
+  dayTs[k]=auto?(dayTs[k]||1):Date.now();
+  lsSet('dt_days',days);lsSet('dt_dayTs',dayTs);
+  schedulePush();
 }
 function persistTpl(){
-  lsSet('dt_tpl',template);
+  tplTs=Date.now();
+  lsSet('dt_tpl',template);lsSet('dt_tplTs',tplTs);
+  schedulePush();
 }
+
+/* ---------- サーバー同期 ---------- */
+let pushTimer=null,syncing=false;
+function online(){return !!(cfg.url&&cfg.token)}
+function api(path,opt){
+  opt=opt||{};
+  return fetch(cfg.url.replace(/\/+$/,'')+path,Object.assign({},opt,{headers:Object.assign({'Authorization':'Bearer '+cfg.token,'Content-Type':'application/json'},opt.headers||{})}))
+    .then(async r=>{const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||('HTTP '+r.status));return j});
+}
+function setDot(st){const d=$('syncDot');d.className='dot'+(st==='ok'?' ok':st==='ng'?' ng':'')}
+function applyServer(sv){
+  let changed=false;
+  Object.keys(sv.days||{}).forEach(k=>{
+    const ts=(sv.dayTs||{})[k]||0;
+    if(!days[k]||ts>(dayTs[k]||0)){days[k]=JSON.parse(JSON.stringify(sv.days[k]));dayTs[k]=ts;changed=true}
+  });
+  if((sv.tplTs||0)>tplTs){template=JSON.parse(JSON.stringify(sv.template));tplTs=sv.tplTs;changed=true}
+  if(changed){lsSet('dt_days',days);lsSet('dt_dayTs',dayTs);lsSet('dt_tpl',template);lsSet('dt_tplTs',tplTs)}
+  return changed;
+}
+function needsPush(sv){
+  if(tplTs>(sv.tplTs||0))return true;
+  return Object.keys(days).some(k=>days[k]&&(dayTs[k]||0)>((sv.dayTs||{})[k]||0));
+}
+function recentDays(){
+  const cut=new Date();cut.setDate(cut.getDate()-60);const ck=keyOf(cut);const o={},t={};
+  Object.keys(days).forEach(k=>{if(k>=ck&&days[k]){o[k]=days[k];t[k]=dayTs[k]||0}});return {days:o,dayTs:t};
+}
+async function pushNow(){
+  if(!online())return;
+  try{
+    const r=recentDays();
+    const sv=await api('/api/state',{method:'PUT',body:JSON.stringify({days:r.days,dayTs:r.dayTs,template,tplTs})});
+    if(applyServer(sv))render();
+    setDot('ok');
+  }catch(e){setDot('ng')}
+}
+function schedulePush(){if(!online())return;clearTimeout(pushTimer);pushTimer=setTimeout(pushNow,1200)}
+async function pullNow(){
+  if(!online()||syncing)return;syncing=true;
+  try{
+    const sv=await api('/api/state');
+    if(applyServer(sv)&&!$('sheet').classList.contains('open'))render();
+    if(needsPush(sv))await pushNow();
+    setDot('ok');
+  }catch(e){setDot('ng')}
+  syncing=false;
+}
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')pullNow();else if(pushTimer){clearTimeout(pushTimer);pushNow()}});
 function persistOpts(){lsSet('dt_opts',{cascade,hideDone})}
 
 function loadCloudDay(){}
@@ -215,7 +305,7 @@ function render(){
   let arr=days[k];
   if(!arr){
     // 未作成の日:ルーティンから自動作成
-    if(template&&template.length){arr=ensureDay();persistDay(k)}
+    if(template&&template.length){arr=ensureDay();persistDay(k,true)}
     else arr=[];
   }
   const done=arr.filter(x=>x.done).length;
@@ -237,11 +327,11 @@ function render(){
       '<div class="body"><button class="title" data-act="edit"></button>'+
       '<div class="shift"><button data-act="sh" data-d="-15">−15分</button><button data-act="sh" data-d="15">+15分</button><button data-act="sh" data-d="30">+30分</button></div></div>'+
       '<button class="chk" data-act="done" aria-label="済にする"><i>'+(x.done?'済':'')+'</i></button>';
-    el.querySelector('.title').textContent=x.t;
+    const tt=el.querySelector('.title');tt.textContent=x.t||'(未入力)';if(!x.t)tt.classList.add('ph');
     el.addEventListener('click',ev=>{
       const b=ev.target.closest('[data-act]');if(!b)return;
       const a=b.dataset.act;
-      if(a==='done'){const nd=!x.done;days[k]=days[k].map(y=>y.id===x.id?Object.assign({},y,{done:nd}):Object.assign({},y));persistDay(k);render();if(nd)toast('「'+x.t+'」済')}
+      if(a==='done'){const nd=!x.done;days[k]=days[k].map(y=>y.id===x.id?Object.assign({},y,{done:nd}):Object.assign({},y));persistDay(k);render();if(nd)toast(x.t?'「'+x.t+'」済':'済')}
       else if(a==='sh')shift(x,+b.dataset.d);
       else if(a==='edit')openSheet(x);
     });
@@ -304,7 +394,6 @@ $('save').onclick=()=>{
   const msg=$('sMsg');msg.textContent='';
   try{
     const t=$('fTitle').value.trim();
-    if(!t){msg.textContent='タスク名を入れてください';return}
     const k=keyOf(cur);
     const arr=ensureDay().map(y=>Object.assign({},y));
     if(editing){const i=arr.findIndex(y=>y.id===editing.id);if(i>=0)Object.assign(arr[i],{t,s:fs,e:fe})}
@@ -351,7 +440,68 @@ $('list').addEventListener('touchstart',e=>{sx=e.touches[0].clientX;sy=e.touches
 $('list').addEventListener('touchend',e=>{if(sx==null)return;const dx=e.changedTouches[0].clientX-sx,dy=e.changedTouches[0].clientY-sy;if(Math.abs(dx)>70&&Math.abs(dy)<40)go(dx<0?1:-1);sx=null},{passive:true});
 
 setInterval(()=>{if(isToday()&&!$('sheet').classList.contains('open'))render()},60000);
+
+/* ---------- 設定:同期と通知 ---------- */
+const b64ToU8=b=>{b=b.replace(/-/g,'+').replace(/_/g,'/');while(b.length%4)b+='=';const r=atob(b),u=new Uint8Array(r.length);for(let i=0;i<r.length;i++)u[i]=r.charCodeAt(i);return u};
+const isStandalone=()=>window.matchMedia('(display-mode: standalone)').matches||navigator.standalone===true;
+function cfgMsg(t){$('cfgStatus').textContent=t}
+function cfgRefresh(){
+  const lines=[];
+  lines.push(online()?'サーバー:設定済み':'サーバー:未設定');
+  if(!('Notification' in window)||!('serviceWorker' in navigator))lines.push('通知:このブラウザでは使えません'+(isStandalone()?'':'(ホーム画面から開いてください)'));
+  else lines.push('通知:'+({granted:'オン',denied:'拒否されています(iPhoneの設定→通知から許可)',default:'まだオンにしていません'})[Notification.permission]);
+  cfgMsg(lines.join('\n'));
+}
+function openCfg(){
+  $('cfgUrl').value=cfg.url||'';$('cfgToken').value=cfg.token||'';cfgRefresh();
+  $('mask').style.display='block';requestAnimationFrame(()=>$('cfg').classList.add('open'));
+}
+function closeCfg(){$('cfg').classList.remove('open');$('mask').style.display='none';document.activeElement&&document.activeElement.blur()}
+$('gear').onclick=openCfg;$('cfgClose').onclick=closeCfg;
+$('mask').addEventListener('click',closeCfg);
+$('cfgSave').onclick=async()=>{
+  cfg={url:$('cfgUrl').value.trim(),token:$('cfgToken').value.trim()};lsSet('dt_cfg',cfg);
+  if(!online()){cfgMsg('URLと合言葉の両方を入れてください');return}
+  cfgMsg('接続中…');
+  try{await api('/api/state');await pullNow();await pushNow();cfgMsg('接続できました。予定をサーバーと同期しました。\n次に「通知をオンにする」を押してください。')}
+  catch(e){setDot('ng');cfgMsg('接続できませんでした:'+e.message+'\nURLと合言葉を確認してください。')}
+};
+async function subscribePush(){
+  if(!online())throw new Error('先にサーバーURLと合言葉を保存してください');
+  if(!('serviceWorker' in navigator)||!('PushManager' in window))throw new Error(isStandalone()?'この端末では通知が使えません(iOS 16.4以降が必要です)':'ホーム画面に追加したアイコンから開いて、もう一度押してください');
+  const perm=await Notification.requestPermission();
+  if(perm!=='granted')throw new Error('通知が許可されませんでした');
+  const reg=await navigator.serviceWorker.ready;
+  const {publicKey}=await api('/api/vapid');
+  let sub=await reg.pushManager.getSubscription();
+  if(sub&&sub.options&&sub.options.applicationServerKey){
+    const cur=new Uint8Array(sub.options.applicationServerKey),want=b64ToU8(publicKey);
+    if(cur.length!==want.length||cur.some((v,i)=>v!==want[i])){await sub.unsubscribe();sub=null}
+  }
+  if(!sub)sub=await reg.pushManager.subscribe({userVisibleOnly:true,applicationServerKey:b64ToU8(publicKey)});
+  await api('/api/subscribe',{method:'POST',body:JSON.stringify({subscription:sub.toJSON()})});
+}
+$('cfgPush').onclick=async()=>{
+  cfgMsg('設定中…');
+  try{await subscribePush();cfgRefresh();cfgMsg($('cfgStatus').textContent+'\n通知の登録ができました。「テスト通知を送る」で確認できます。')}
+  catch(e){cfgMsg('通知をオンにできませんでした:'+e.message)}
+};
+$('cfgTest').onclick=async()=>{
+  cfgMsg('送信中…');
+  try{const r=await api('/api/test',{method:'POST'});cfgMsg(r.sent?'送りました。数秒で届きます。':'送れませんでした'+(r.note?':'+r.note:'('+JSON.stringify(r.results)+')'))}
+  catch(e){cfgMsg('送れませんでした:'+e.message)}
+};
+// 通知の登録は時々更新しておく(iPhoneが登録を入れ替えることがあるため)
+async function refreshSub(){
+  try{
+    if(!online()||!('serviceWorker' in navigator)||Notification.permission!=='granted')return;
+    const reg=await navigator.serviceWorker.ready;const sub=await reg.pushManager.getSubscription();
+    if(sub)await api('/api/subscribe',{method:'POST',body:JSON.stringify({subscription:sub.toJSON()})});
+    else await subscribePush();
+  }catch(e){}
+}
 render();
+setDot(online()?'':'');pullNow();setTimeout(refreshSub,3000);
 if('serviceWorker' in navigator){window.addEventListener('load',()=>navigator.serviceWorker.register('sw.js').catch(()=>{}))}
 })();
 </script>
